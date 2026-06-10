@@ -8,7 +8,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import insert, select, update, delete
 from telegram import Update
 
-from models import engine, alerts
+from models import engine, alerts, init_db
 from railway import get_status
 from telegram_bot import send_alert, build_application, BOT_TOKEN, WEBHOOK_URL
 from scheduler import scheduler
@@ -112,6 +112,9 @@ def check_alerts():
 # ── FastAPI lifecycle ─────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
+    # Wait for PostgreSQL to be ready
+    init_db()
+
     await _bot_app.initialize()
     await _bot_app.start()
 
