@@ -1,19 +1,28 @@
 import os
 import time
-from sqlalchemy import *
+from sqlalchemy import (
+    create_engine,
+    MetaData,
+    Table,
+    Column,
+    Integer,
+    String,
+    Boolean,
+)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///alerts.db")
 
+# Railway gives postgres:// but SQLAlchemy needs postgresql://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace(
         "postgres://",
         "postgresql://",
-        1
+        1,
     )
 
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True
+    pool_pre_ping=True,
 )
 
 metadata = MetaData()
@@ -31,12 +40,18 @@ alerts = Table(
     Column("notified", Boolean, default=False),
 )
 
+
+def init_db():
+    """Create tables if they don't exist."""
+    metadata.create_all(engine)
+
+
 # Retry DB startup
 for attempt in range(15):
     try:
-        metadata.create_all(engine)
+        init_db()
         print("Database connected")
         break
     except Exception as e:
-        print(f"Database not ready ({attempt+1}/15): {e}")
+        print(f"Database not ready ({attempt + 1}/15): {e}")
         time.sleep(5)
