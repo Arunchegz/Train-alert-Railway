@@ -1,12 +1,14 @@
 import logging
 import os
+import time
 from datetime import datetime, date
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import insert, select, update, delete
 from telegram import Update
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
 
 from models import engine, alerts, init_db
 from railway import get_status
@@ -16,11 +18,49 @@ from scheduler import scheduler
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("train-alert")
 
+# Set ADMIN_CHAT_ID env var to your Telegram chat ID to receive crash alerts
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
+
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
 # Single shared bot instance
 _bot_app = build_application()
+
+
+# ── Scheduler crash listener ──────────────────────────────────────────────────
+def on_scheduler_error(event):
+    job_id = event.job_id
+    exc = event.exception
+
+    logger.error(f"Scheduler job '{job_id}' crashed: {exc}")
+
+    if ADMIN_CHAT_ID:
+        send_alert(
+            ADMIN_CHAT_ID,
+            f"⚠️ *Scheduler Job Crashed!*\n\n"
+            f"Job: `{job_id}`\n"
+            f"Error: `{exc}`\n\n"
+            f"The job will resume at its next scheduled interval.",
+        )
+    else:
+        logger.warning("ADMIN_CHAT_ID not set — cannot send crash notification")
+
+
+def on_scheduler_missed(event):
+    job_id = event.job_id
+    scheduled_time = event.scheduled_run_time
+
+    logger.warning(f"Scheduler job '{job_id}' missed its run at {scheduled_time}")
+
+    if ADMIN_CHAT_ID:
+        send_alert(
+            ADMIN_CHAT_ID,
+            f"⏰ *Scheduler Job Missed!*\n\n"
+            f"Job: `{job_id}`\n"
+            f"Was due at: `{scheduled_time}`\n\n"
+            f"This usually means the server was overloaded or restarting.",
+        )
 
 
 # ── Alert expiry ──────────────────────────────────────────────────────────────
@@ -29,8 +69,12 @@ def purge_expired_alerts():
     today = date.today()
     expired = []
 
-    with engine.connect() as conn:
-        rows = conn.execute(select(alerts)).fetchall()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(select(alerts)).fetchall()
+    except Exception as e:
+        logger.error(f"DB unavailable during purge, skipping: {e}")
+        return
 
     for row in rows:
         try:
@@ -57,8 +101,12 @@ def check_alerts():
 
     purge_expired_alerts()
 
-    with engine.connect() as conn:
-        rows = conn.execute(select(alerts)).fetchall()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(select(alerts)).fetchall()
+    except Exception as e:
+        logger.error(f"DB unavailable during alert check, skipping: {e}")
+        return
 
     logger.info(f"Found {len(rows)} active alerts")
 
@@ -112,8 +160,17 @@ def check_alerts():
 # ── FastAPI lifecycle ─────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
-    # Wait for PostgreSQL to be ready
-    init_db()
+    # Wait for PostgreSQL to be ready (up to 75 seconds)
+    for attempt in range(15):
+        try:
+            init_db()
+            logger.info("Database connected")
+            break
+        except Exception as e:
+            logger.warning(f"Database not ready ({attempt + 1}/15): {e}")
+            time.sleep(5)
+    else:
+        logger.error("Database never became ready — proceeding anyway")
 
     await _bot_app.initialize()
     await _bot_app.start()
@@ -142,6 +199,8 @@ async def startup_event():
         id="purge_expired_alerts",
         replace_existing=True,
     )
+    scheduler.add_listener(on_scheduler_error, EVENT_JOB_ERROR)
+    scheduler.add_listener(on_scheduler_missed, EVENT_JOB_MISSED)
     scheduler.start()
     logger.info("Scheduler started")
 
@@ -164,6 +223,11 @@ async def webhook(request: Request):
 
 
 # ── Web routes ────────────────────────────────────────────────────────────────
+@app.head("/")
+def health_head():
+    return Response(status_code=200)
+
+
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
     return templates.TemplateResponse(request=request, name="index.html")
