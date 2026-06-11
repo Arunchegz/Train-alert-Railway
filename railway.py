@@ -1,4 +1,6 @@
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 def get_status(
@@ -18,10 +20,19 @@ def get_status(
             f"{travel_class}/{quota}.json"
         )
 
-        response = requests.get(
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=2,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session = requests.Session()
+        session.mount("https://", adapter)
+
+        response = session.get(
             url,
             headers={
-                "User-Agent": "Mozilla/5.0"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
             },
             timeout=20
         )
