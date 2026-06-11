@@ -1,12 +1,13 @@
 import logging
 import os
 import requests
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -32,33 +33,89 @@ logger = logging.getLogger("train-alert-bot")
 
 CLASS_OPTIONS = [["SL", "3A", "2A"], ["1A", "CC", "2S"], ["EC", "FC"]]
 
+# ── Buzzer state ──────────────────────────────────────────────────────────────
+# Maps alert_id -> True for alerts currently in continuous-buzz mode.
+# Shared with main.py via this module-level dict.
+active_buzzers: dict[int, bool] = {}
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def send_alert(chat_id: str, message: str) -> None:
+    """Send a plain text alert (no inline button)."""
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": message},
+            json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
             timeout=30,
         )
     except Exception as exc:
         logger.error("Failed to send alert to %s: %s", chat_id, exc)
 
 
-def _save_alert(data: dict, chat_id: str) -> None:
-    with engine.connect() as conn:
-        conn.execute(
-            insert(alerts).values(
-                train_number=data["train_number"],
-                from_station=data["from_station"],
-                to_station=data["to_station"],
-                journey_date=data["journey_date"],
-                class_code=data["class_code"],
-                telegram_chat_id=str(chat_id),
-                notified=False,
-            )
+def send_buzz_message(chat_id: str, alert_id: int, message: str) -> None:
+    """Send a buzz message with an inline STOP ALERT button."""
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🛑 Stop Alert", callback_data=f"stop_{alert_id}")]]
+    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "Markdown",
+                "reply_markup": keyboard.to_dict(),
+            },
+            timeout=30,
         )
-        conn.commit()
+    except Exception as exc:
+        logger.error("Failed to send buzz to %s: %s", chat_id, exc)
+
+
+def stop_buzzer(alert_id: int) -> None:
+    """Remove alert from active buzzers and delete it from the DB."""
+    active_buzzers.pop(alert_id, None)
+    try:
+        with engine.connect() as conn:
+            conn.execute(delete(alerts).where(alerts.c.id == alert_id))
+            conn.commit()
+        logger.info(f"Buzzer stopped and alert {alert_id} deleted")
+    except Exception as e:
+        logger.error(f"Error deleting alert {alert_id}: {e}")
+
+
+# ── Inline button handler ─────────────────────────────────────────────────────
+async def handle_stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # e.g. "stop_42"
+    if not data.startswith("stop_"):
+        return
+
+    try:
+        alert_id = int(data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        return
+
+    stop_buzzer(alert_id)
+
+    # Edit the original message to confirm stop
+    try:
+        await query.edit_message_text(
+            text=(
+                query.message.text
+                + "\n\n✅ *Alert stopped.* You won't receive further notifications for this alert."
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        # If edit fails (e.g. message too old), just send a new message
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="✅ *Alert stopped.* You won't receive further notifications.",
+            parse_mode="Markdown",
+        )
 
 
 # ── /start & /help ────────────────────────────────────────────────────────────
@@ -94,7 +151,10 @@ async def my_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines = ["📋 *Your alerts:*\n"]
     for i, row in enumerate(rows, 1):
-        status = "✅ Notified" if row.notified else "⏳ Watching"
+        if row.id in active_buzzers:
+            status = "🔔 Buzzing — seats available!"
+        else:
+            status = "⏳ Watching"
         lines.append(
             f"{i}. Train *{row.train_number}* | {row.from_station} → {row.to_station}\n"
             f"   Date: {row.journey_date} | Class: {row.class_code} | {status}"
@@ -226,6 +286,22 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+def _save_alert(data: dict, chat_id: str) -> None:
+    with engine.connect() as conn:
+        conn.execute(
+            insert(alerts).values(
+                train_number=data["train_number"],
+                from_station=data["from_station"],
+                to_station=data["to_station"],
+                journey_date=data["journey_date"],
+                class_code=data["class_code"],
+                telegram_chat_id=str(chat_id),
+                notified=False,
+            )
+        )
+        conn.commit()
+
+
 # ── /deletealert ──────────────────────────────────────────────────────────────
 async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = str(update.effective_chat.id)
@@ -242,7 +318,12 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not context.args:
         lines = ["Which alert do you want to delete?\nUse: /deletealert <number>\n"]
         for i, row in enumerate(rows, 1):
-            status = "✅ Notified" if row.notified else "⏳ Watching"
+            if row.id in active_buzzers:
+                status = "🔔 Buzzing"
+            elif row.notified:
+                status = "✅ Notified"
+            else:
+                status = "⏳ Watching"
             lines.append(
                 f"{i}. Train *{row.train_number}* | {row.from_station} → {row.to_station}\n"
                 f"   Date: {row.journey_date} | Class: {row.class_code} | {status}"
@@ -262,6 +343,9 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     target = rows[index - 1]
+    # Also stop any running buzzer for this alert
+    active_buzzers.pop(target.id, None)
+
     with engine.connect() as conn:
         conn.execute(delete(alerts).where(alerts.c.id == target.id))
         conn.commit()
@@ -296,5 +380,6 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("myalerts", my_alerts))
     app.add_handler(CommandHandler("deletealert", delete_alert))
     app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(handle_stop_callback, pattern=r"^stop_\d+$"))
 
     return app
