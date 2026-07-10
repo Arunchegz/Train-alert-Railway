@@ -8,6 +8,7 @@ from sqlalchemy import (
     Integer,
     String,
     Boolean,
+    text,
 )
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///alerts.db")
@@ -52,8 +53,38 @@ alerts = Table(
 
 
 def init_db():
-    """Create tables if they don't exist."""
+    """Create tables if they don't exist and run auto-migrations."""
     metadata.create_all(engine)
+    
+    # Run migrations for SQLite or Postgres
+    with engine.connect() as conn:
+        try:
+            if DATABASE_URL.startswith("sqlite"):
+                cursor = conn.execute(text("PRAGMA table_info(alerts)"))
+                columns = [row[1] for row in cursor.fetchall()]
+            else:
+                cursor = conn.execute(text(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name='alerts'"
+                ))
+                columns = [row[0] for row in cursor.fetchall()]
+            
+            # Add missing columns
+            if "is_buzzing" not in columns:
+                conn.execute(text("ALTER TABLE alerts ADD COLUMN is_buzzing BOOLEAN DEFAULT 0"))
+                print("Database migration: Added is_buzzing column")
+            if "alert_on" not in columns:
+                conn.execute(text("ALTER TABLE alerts ADD COLUMN alert_on VARCHAR DEFAULT 'AVAILABLE'"))
+                print("Database migration: Added alert_on column")
+            if "last_checked_status" not in columns:
+                conn.execute(text("ALTER TABLE alerts ADD COLUMN last_checked_status VARCHAR"))
+                print("Database migration: Added last_checked_status column")
+            if "last_checked_time" not in columns:
+                conn.execute(text("ALTER TABLE alerts ADD COLUMN last_checked_time VARCHAR"))
+                print("Database migration: Added last_checked_time column")
+                
+            conn.commit()
+        except Exception as e:
+            print(f"Migration check/execution error: {e}")
 
 
 # Retry DB startup
