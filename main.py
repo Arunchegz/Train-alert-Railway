@@ -366,7 +366,7 @@ async def startup_event():
     scheduler.add_job(
         check_alerts,
         "interval",
-        minutes=10,
+        minutes=4,
         id="train_alert_checker",
         replace_existing=True,
     )
