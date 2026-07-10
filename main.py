@@ -12,7 +12,7 @@ from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
 
 from models import engine, alerts, init_db
 from railway import get_status
-from telegram_bot import send_alert, send_buzz_message, stop_buzzer, active_buzzers, build_application, BOT_TOKEN, WEBHOOK_URL
+from telegram_bot import send_alert, send_buzz_message, stop_buzzer, build_application, BOT_TOKEN, WEBHOOK_URL
 from scheduler import scheduler
 
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +26,9 @@ templates = Jinja2Templates(directory="templates")
 _bot_app = build_application()
 
 # ── Bad statuses that mean "no availability" ──────────────────────────────────
+# Note: 'ERROR' is included here because if the API explicitly returns "ERROR",
+# it usually means the train/date/class combo is invalid or fully booked logically.
+# However, None (network error) is handled separately.
 NO_AVAILABILITY_STATUSES = {
     "REGRET",
     "NOT AVAILABLE",
@@ -89,10 +92,13 @@ def purge_expired_alerts():
             logger.warning(f"Could not parse date for alert {row.id}: {row.journey_date}")
 
     if expired:
-        # Also stop any buzzers for expired alerts
-        for aid in expired:
-            active_buzzers.pop(aid, None)
+        # Stop any buzzers for expired alerts by updating DB
         with engine.connect() as conn:
+            conn.execute(
+                update(alerts)
+                .where(alerts.c.id.in_(expired))
+                .values(is_buzzing=False)
+            )
             conn.execute(delete(alerts).where(alerts.c.id.in_(expired)))
             conn.commit()
         logger.info(f"Purged {len(expired)} expired alert(s): IDs {expired}")
@@ -108,28 +114,59 @@ def buzz_alert(alert_id: int, chat_id: str, train_number: str,
     Called every 5 seconds while a seat is available.
     Re-checks availability; stops automatically if seats disappear.
     """
-    if alert_id not in active_buzzers:
-        # Buzzer was stopped externally (button press / delete) — remove the job
-        try:
-            scheduler.remove_job(f"buzz_{alert_id}")
-        except Exception:
-            pass
+    # Check DB to see if this alert is still marked as buzzing
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                select(alerts).where(alerts.c.id == alert_id)
+            ).first()
+            
+            # If alert doesn't exist or is_buzzing is False, stop
+            if not row or not row.is_buzzing:
+                try:
+                    scheduler.remove_job(f"buzz_{alert_id}")
+                except Exception:
+                    pass
+                return
+    except Exception as e:
+        logger.error(f"Error checking DB state for alert {alert_id}: {e}")
         return
 
     try:
-        status = str(get_status(train_number, from_station, to_station, journey_date, class_code)).strip().upper()
+        status = get_status(train_number, from_station, to_station, journey_date, class_code)
     except Exception as e:
         logger.error(f"Buzz re-check error for alert {alert_id}: {e}")
         return
 
+    # If status is None, it means a network error occurred.
+    # We do NOT stop the buzzer. We just log and skip this cycle.
+    if status is None:
+        logger.warning(f"Network error for alert {alert_id}, skipping notification.")
+        return
+
+    status = str(status).strip().upper()
+
     if status in NO_AVAILABILITY_STATUSES:
         # Seats gone — stop buzzing, do NOT mark notified so it can re-trigger later
         logger.info(f"Seats gone for alert {alert_id}, stopping buzzer (status={status})")
-        active_buzzers.pop(alert_id, None)
+        
+        # Update DB to stop buzzing
+        try:
+            with engine.connect() as conn:
+                conn.execute(
+                    update(alerts)
+                    .where(alerts.c.id == alert_id)
+                    .values(is_buzzing=False)
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to update DB for alert {alert_id}: {e}")
+
         try:
             scheduler.remove_job(f"buzz_{alert_id}")
         except Exception:
             pass
+            
         send_alert(
             chat_id,
             f"😔 *Seats no longer available*\n\n"
@@ -173,11 +210,13 @@ def check_alerts():
     for row in rows:
         logger.info(f"Checking alert ID {row.id}")
 
-        # Skip if already notified or buzzer already running
+        # Skip if already notified
         if row.notified:
             logger.info("Already notified, skipping")
             continue
-        if row.id in active_buzzers:
+        
+        # Skip if buzzer already running (check DB)
+        if row.is_buzzing:
             logger.info("Buzzer already running, skipping")
             continue
 
@@ -191,46 +230,111 @@ def check_alerts():
             )
             logger.info(f"Train={row.train_number} Class={row.class_code} Status={status}")
 
-            status = str(status).strip().upper()
-            if status not in NO_AVAILABILITY_STATUSES:
-                logger.info(f"Bookable status found for alert {row.id} — starting buzzer")
+            # If status is None, it was a network error. Don't start buzzer.
+            if status is None:
+                logger.warning(f"Network error checking alert {row.id}, skipping.")
+                # Still update last checked time/status to reflect the attempt
+                _update_last_check(row.id, "NETWORK_ERROR", datetime.now())
+                continue
 
-                # Mark this alert as actively buzzing
-                active_buzzers[row.id] = True
+            status = str(status).strip().upper()
+            
+            # Update last checked status and time for ALL checks
+            _update_last_check(row.id, status, datetime.now())
+
+            # If status is 'ERROR' (logical error from API), don't start buzzer
+            if status in NO_AVAILABILITY_STATUSES:
+                logger.info(f"Non-bookable status for alert {row.id}: {status}")
+                continue
+
+            # Evaluate alert_on condition
+            alert_on = row.alert_on if row.alert_on else "AVAILABLE"
+            should_trigger = False
+
+            if alert_on == "AVAILABLE":
+                # Triggers only if status starts with 'AVAILABLE', 'AVBL', or 'CURR_AVBL'
+                if status.startswith("AVAILABLE") or status.startswith("AVBL") or status.startswith("CURR_AVBL"):
+                    should_trigger = True
+            elif alert_on == "RAC":
+                # Triggers if status starts with 'AVAILABLE', 'AVBL', 'CURR_AVBL', or 'RAC'
+                if (status.startswith("AVAILABLE") or status.startswith("AVBL") or 
+                    status.startswith("CURR_AVBL") or status.startswith("RAC")):
+                    should_trigger = True
+            elif alert_on == "WL":
+                # Triggers if status is not in NO_AVAILABILITY_STATUSES
+                if status not in NO_AVAILABILITY_STATUSES:
+                    should_trigger = True
+
+            if not should_trigger:
+                logger.info(f"Condition not met for alert {row.id} (alert_on={alert_on}, status={status})")
+                continue
+
+            logger.info(f"Bookable status found for alert {row.id} — starting buzzer")
+
+            # Mark this alert as actively buzzing in DB
+            try:
+                with engine.connect() as conn:
+                    conn.execute(
+                        update(alerts)
+                        .where(alerts.c.id == row.id)
+                        .values(is_buzzing=True)
+                    )
+                    conn.commit()
+            except Exception as e:
+                logger.error(f"Failed to update is_buzzing for alert {row.id}: {e}")
+                continue
 
                 # Send the first buzz immediately
-                send_buzz_message(
-                    row.telegram_chat_id,
-                    row.id,
-                    f"🔔 *SEATS AVAILABLE — BOOK NOW!*\n\n"
-                    f"Train: *{row.train_number}*\n"
-                    f"Route: {row.from_station} → {row.to_station}\n"
-                    f"Date: {row.journey_date} | Class: {row.class_code}\n"
-                    f"Status: `{status}`\n\n"
-                    f"_You'll be notified every 5 seconds until you book or tap_ 🛑 *Stop Alert*.",
-                )
+            send_buzz_message(
+                row.telegram_chat_id,
+                row.id,
+                f"🔔 *SEATS AVAILABLE — BOOK NOW!*\n\n"
+                f"Train: *{row.train_number}*\n"
+                f"Route: {row.from_station} → {row.to_station}\n"
+                f"Date: {row.journey_date} | Class: {row.class_code}\n"
+                f"Status: `{status}`\n\n"
+                f"_You'll be notified every 5 seconds until you book or tap_ 🛑 *Stop Alert*.",
+            )
 
-                # Schedule a repeating 5-second buzz job
-                scheduler.add_job(
-                    buzz_alert,
-                    "interval",
-                    seconds=5,
-                    id=f"buzz_{row.id}",
-                    replace_existing=True,
-                    kwargs={
-                        "alert_id": row.id,
-                        "chat_id": row.telegram_chat_id,
-                        "train_number": row.train_number,
-                        "from_station": row.from_station,
-                        "to_station": row.to_station,
-                        "journey_date": row.journey_date,
-                        "class_code": row.class_code,
-                    },
-                )
-                logger.info(f"Buzzer started for alert {row.id}")
+            # Schedule a repeating 5-second buzz job
+            scheduler.add_job(
+                buzz_alert,
+                "interval",
+                seconds=5,
+                id=f"buzz_{row.id}",
+                replace_existing=True,
+                kwargs={
+                    "alert_id": row.id,
+                    "chat_id": row.telegram_chat_id,
+                    "train_number": row.train_number,
+                    "from_station": row.from_station,
+                    "to_station": row.to_station,
+                    "journey_date": row.journey_date,
+                    "class_code": row.class_code,
+                },
+            )
+            logger.info(f"Buzzer started for alert {row.id}")
 
         except Exception as e:
             logger.exception(f"Error checking alert {row.id}: {e}")
+
+
+def _update_last_check(alert_id: int, status: str, dt: datetime) -> None:
+    """Helper to update last_checked_status and last_checked_time in DB."""
+    try:
+        time_str = dt.strftime("%H:%M:%S (%d-%m-%Y)")
+        with engine.connect() as conn:
+            conn.execute(
+                update(alerts)
+                .where(alerts.c.id == alert_id)
+                .values(
+                    last_checked_status=status,
+                    last_checked_time=time_str
+                )
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to update last check info for alert {alert_id}: {e}")
 
 
 # ── FastAPI lifecycle ─────────────────────────────────────────────────────────
@@ -327,6 +431,10 @@ def add_alert_web(
                 class_code=class_code,
                 telegram_chat_id=telegram_chat_id,
                 notified=False,
+                is_buzzing=False,
+                alert_on="AVAILABLE", # Default for web form
+                last_checked_status=None,
+                last_checked_time=None,
             )
         )
         conn.commit()

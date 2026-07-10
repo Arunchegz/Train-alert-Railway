@@ -1,6 +1,7 @@
 import logging
 import os
 import requests
+from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
@@ -11,7 +12,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from sqlalchemy import insert, select, delete
+from sqlalchemy import insert, select, delete, update
 from models import engine, alerts
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -28,15 +29,16 @@ logger = logging.getLogger("train-alert-bot")
     TO_STATION,
     JOURNEY_DATE,
     CLASS_CODE,
+    ALERT_ON,
     CONFIRM,
-) = range(6)
+) = range(7)
 
 CLASS_OPTIONS = [["SL", "3A", "2A"], ["1A", "CC", "2S"], ["EC", "FC"]]
 
-# ── Buzzer state ──────────────────────────────────────────────────────────────
-# Maps alert_id -> True for alerts currently in continuous-buzz mode.
-# Shared with main.py via this module-level dict.
-active_buzzers: dict[int, bool] = {}
+# Mapping for alert_on choices
+ALERT_ON_OPTIONS = [
+    ["Available Only", "RAC or Better", "Waiting List or Better"]
+]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -73,15 +75,24 @@ def send_buzz_message(chat_id: str, alert_id: int, message: str) -> None:
 
 
 def stop_buzzer(alert_id: int) -> None:
-    """Remove alert from active buzzers and delete it from the DB."""
-    active_buzzers.pop(alert_id, None)
+    """
+    Stop the buzzer for a specific alert.
+    Updates the database to set is_buzzing=False and deletes the alert.
+    """
     try:
         with engine.connect() as conn:
+            # Update the database to reflect that buzzing has stopped
+            conn.execute(
+                update(alerts)
+                .where(alerts.c.id == alert_id)
+                .values(is_buzzing=False)
+            )
+            # Delete the alert from the database
             conn.execute(delete(alerts).where(alerts.c.id == alert_id))
             conn.commit()
         logger.info(f"Buzzer stopped and alert {alert_id} deleted")
     except Exception as e:
-        logger.error(f"Error deleting alert {alert_id}: {e}")
+        logger.error(f"Error stopping buzzer/deleting alert {alert_id}: {e}")
 
 
 # ── Inline button handler ─────────────────────────────────────────────────────
@@ -151,13 +162,21 @@ async def my_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines = ["📋 *Your alerts:*\n"]
     for i, row in enumerate(rows, 1):
-        if row.id in active_buzzers:
+        # Read is_buzzing status from DB
+        if row.is_buzzing:
             status = "🔔 Buzzing — seats available!"
         else:
             status = "⏳ Watching"
+        
+        # Format last checked info
+        last_status = row.last_checked_status if row.last_checked_status else "Pending..."
+        last_time = row.last_checked_time if row.last_checked_time else ""
+        last_check_info = f"\n   Last Check: {last_status} at {last_time}" if last_time else f"\n   Last Check: {last_status}"
+
         lines.append(
             f"{i}. Train *{row.train_number}* | {row.from_station} → {row.to_station}\n"
             f"   Date: {row.journey_date} | Class: {row.class_code} | {status}"
+            f"{last_check_info}"
         )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -207,21 +226,23 @@ async def recv_to_station(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def recv_journey_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
-    parts = text.split("-")
-    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+    try:
+        # Strict validation using strptime
+        datetime.strptime(text, "%d-%m-%Y")
+        context.user_data["journey_date"] = text
         await update.message.reply_text(
-            "⚠️ Please use DD-MM-YYYY format (e.g. 25-07-2025):"
+            "Choose the *travel class*:",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardMarkup(
+                CLASS_OPTIONS, one_time_keyboard=True, resize_keyboard=True
+            ),
+        )
+        return CLASS_CODE
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ Invalid date format. Please use DD-MM-YYYY (e.g. 25-07-2025):"
         )
         return JOURNEY_DATE
-    context.user_data["journey_date"] = text
-    await update.message.reply_text(
-        "Choose the *travel class*:",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(
-            CLASS_OPTIONS, one_time_keyboard=True, resize_keyboard=True
-        ),
-    )
-    return CLASS_CODE
 
 
 async def recv_class_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -234,6 +255,29 @@ async def recv_class_code(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return CLASS_CODE
     context.user_data["class_code"] = code
 
+    await update.message.reply_text(
+        "Choose the *notification condition*:",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(
+            ALERT_ON_OPTIONS, one_time_keyboard=True, resize_keyboard=True
+        ),
+    )
+    return ALERT_ON
+
+
+async def recv_alert_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    choice = update.message.text.strip()
+    
+    # Map UI choices to DB values
+    mapping = {
+        "Available Only": "AVAILABLE",
+        "RAC or Better": "RAC",
+        "Waiting List or Better": "WL"
+    }
+    
+    alert_on_value = mapping.get(choice, "AVAILABLE")
+    context.user_data["alert_on"] = alert_on_value
+
     d = context.user_data
     summary = (
         f"📝 *Alert summary:*\n\n"
@@ -241,7 +285,8 @@ async def recv_class_code(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"From   : {d['from_station']}\n"
         f"To     : {d['to_station']}\n"
         f"Date   : {d['journey_date']}\n"
-        f"Class  : {d['class_code']}\n\n"
+        f"Class  : {d['class_code']}\n"
+        f"Alert On: {choice}\n\n"
         f"Confirm? (yes / no)"
     )
     await update.message.reply_text(
@@ -297,6 +342,10 @@ def _save_alert(data: dict, chat_id: str) -> None:
                 class_code=data["class_code"],
                 telegram_chat_id=str(chat_id),
                 notified=False,
+                is_buzzing=False,
+                alert_on=data.get("alert_on", "AVAILABLE"),
+                last_checked_status=None,
+                last_checked_time=None,
             )
         )
         conn.commit()
@@ -318,15 +367,23 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not context.args:
         lines = ["Which alert do you want to delete?\nUse: /deletealert <number>\n"]
         for i, row in enumerate(rows, 1):
-            if row.id in active_buzzers:
+            # Read is_buzzing status from DB
+            if row.is_buzzing:
                 status = "🔔 Buzzing"
             elif row.notified:
                 status = "✅ Notified"
             else:
                 status = "⏳ Watching"
+            
+            # Format last checked info
+            last_status = row.last_checked_status if row.last_checked_status else "Pending..."
+            last_time = row.last_checked_time if row.last_checked_time else ""
+            last_check_info = f"\n   Last Check: {last_status} at {last_time}" if last_time else f"\n   Last Check: {last_status}"
+
             lines.append(
                 f"{i}. Train *{row.train_number}* | {row.from_station} → {row.to_station}\n"
                 f"   Date: {row.journey_date} | Class: {row.class_code} | {status}"
+                f"{last_check_info}"
             )
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
@@ -343,12 +400,9 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     target = rows[index - 1]
-    # Also stop any running buzzer for this alert
-    active_buzzers.pop(target.id, None)
-
-    with engine.connect() as conn:
-        conn.execute(delete(alerts).where(alerts.c.id == target.id))
-        conn.commit()
+    
+    # Stop buzzer logic (updates DB and deletes)
+    stop_buzzer(target.id)
 
     await update.message.reply_text(
         f"🗑️ Deleted alert for train *{target.train_number}* "
@@ -370,6 +424,7 @@ def build_application() -> Application:
             TO_STATION:   [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_to_station)],
             JOURNEY_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_journey_date)],
             CLASS_CODE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_class_code)],
+            ALERT_ON:     [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_alert_on)],
             CONFIRM:      [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_confirm)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],

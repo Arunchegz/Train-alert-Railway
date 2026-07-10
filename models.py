@@ -41,6 +41,13 @@ alerts = Table(
     Column("class_code", String),
     Column("telegram_chat_id", String),
     Column("notified", Boolean, default=False),
+    # New column to track if the buzzer is currently active for this alert
+    Column("is_buzzing", Boolean, default=False),
+    # New column: Alert condition type (AVAILABLE, RAC, WL)
+    Column("alert_on", String, default="AVAILABLE"),
+    # New columns: Track last check result
+    Column("last_checked_status", String, nullable=True),
+    Column("last_checked_time", String, nullable=True),
 )
 
 
