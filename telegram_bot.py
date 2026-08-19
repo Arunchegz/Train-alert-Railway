@@ -1,6 +1,5 @@
 import logging
 import os
-import requests
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -14,8 +13,9 @@ from telegram.ext import (
 )
 from sqlalchemy import insert, select, delete, update
 from models import engine, alerts
+from railway import _session, BOT_API_URL
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
@@ -35,7 +35,6 @@ logger = logging.getLogger("train-alert-bot")
 
 CLASS_OPTIONS = [["SL", "3A", "2A"], ["1A", "CC", "2S"], ["EC", "FC"]]
 
-# Mapping for alert_on choices
 ALERT_ON_OPTIONS = [
     ["Available Only", "RAC or Better", "Waiting List or Better"]
 ]
@@ -43,10 +42,10 @@ ALERT_ON_OPTIONS = [
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def send_alert(chat_id: str, message: str) -> None:
-    """Send a plain text alert (no inline button)."""
+    """Send a plain text alert (no inline button), with retry via shared session."""
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        _session.post(
+            f"{BOT_API_URL}{BOT_TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
             timeout=30,
         )
@@ -55,13 +54,13 @@ def send_alert(chat_id: str, message: str) -> None:
 
 
 def send_buzz_message(chat_id: str, alert_id: int, message: str) -> None:
-    """Send a buzz message with an inline STOP ALERT button."""
+    """Send a buzz message with an inline STOP ALERT button, with retry via shared session."""
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton("🛑 Stop Alert", callback_data=f"stop_{alert_id}")]]
     )
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        _session.post(
+            f"{BOT_API_URL}{BOT_TOKEN}/sendMessage",
             json={
                 "chat_id": chat_id,
                 "text": message,
@@ -77,17 +76,23 @@ def send_buzz_message(chat_id: str, alert_id: int, message: str) -> None:
 def stop_buzzer(alert_id: int) -> None:
     """
     Stop the buzzer for a specific alert.
-    Updates the database to set is_buzzing=False and deletes the alert.
+    Updates the database and removes the APScheduler job.
+    Import scheduler lazily to avoid circular import.
     """
+    # Remove APScheduler job first (fix #2)
+    try:
+        from scheduler import scheduler as _sched
+        _sched.remove_job(f"buzz_{alert_id}")
+    except Exception:
+        pass  # Job may already be gone
+
     try:
         with engine.connect() as conn:
-            # Update the database to reflect that buzzing has stopped
             conn.execute(
                 update(alerts)
                 .where(alerts.c.id == alert_id)
                 .values(is_buzzing=False)
             )
-            # Delete the alert from the database
             conn.execute(delete(alerts).where(alerts.c.id == alert_id))
             conn.commit()
         logger.info(f"Buzzer stopped and alert {alert_id} deleted")
@@ -100,7 +105,7 @@ async def handle_stop_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
 
-    data = query.data  # e.g. "stop_42"
+    data = query.data
     if not data.startswith("stop_"):
         return
 
@@ -111,7 +116,6 @@ async def handle_stop_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     stop_buzzer(alert_id)
 
-    # Edit the original message to confirm stop
     try:
         await query.edit_message_text(
             text=(
@@ -121,7 +125,6 @@ async def handle_stop_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="Markdown",
         )
     except Exception:
-        # If edit fails (e.g. message too old), just send a new message
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text="✅ *Alert stopped.* You won't receive further notifications.",
@@ -138,6 +141,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /addalert     — Add a new train alert\n"
         "  /myalerts     — View your active alerts\n"
         "  /deletealert  — Delete a saved alert\n"
+        "  /checkstatus  — Manually trigger an alert check\n"
         "  /cancel       — Cancel current operation\n"
         "  /help         — Show this message",
         parse_mode="Markdown",
@@ -146,6 +150,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start(update, context)
+
+
+# ── /checkstatus ──────────────────────────────────────────────────────────────
+async def check_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fix #10: allow manual one-off check from Telegram."""
+    chat_id = str(update.effective_chat.id)
+    await update.message.reply_text("🔍 Running check now...")
+    from main import check_alerts
+    check_alerts()
+    await update.message.reply_text("✅ Check complete. Use /myalerts to see latest status.")
 
 
 # ── /myalerts ─────────────────────────────────────────────────────────────────
@@ -162,13 +176,11 @@ async def my_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines = ["📋 *Your alerts:*\n"]
     for i, row in enumerate(rows, 1):
-        # Read is_buzzing status from DB
         if row.is_buzzing:
             status = "🔔 Buzzing — seats available!"
         else:
             status = "⏳ Watching"
-        
-        # Format last checked info
+
         last_status = row.last_checked_status if row.last_checked_status else "Pending..."
         last_time = row.last_checked_time if row.last_checked_time else ""
         last_check_info = f"\n   Last Check: {last_status} at {last_time}" if last_time else f"\n   Last Check: {last_status}"
@@ -227,7 +239,6 @@ async def recv_to_station(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def recv_journey_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
     try:
-        # Strict validation using strptime
         datetime.strptime(text, "%d-%m-%Y")
         context.user_data["journey_date"] = text
         await update.message.reply_text(
@@ -267,14 +278,13 @@ async def recv_class_code(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def recv_alert_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     choice = update.message.text.strip()
-    
-    # Map UI choices to DB values
+
     mapping = {
         "Available Only": "AVAILABLE",
         "RAC or Better": "RAC",
         "Waiting List or Better": "WL"
     }
-    
+
     alert_on_value = mapping.get(choice, "AVAILABLE")
     context.user_data["alert_on"] = alert_on_value
 
@@ -367,15 +377,13 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not context.args:
         lines = ["Which alert do you want to delete?\nUse: /deletealert <number>\n"]
         for i, row in enumerate(rows, 1):
-            # Read is_buzzing status from DB
             if row.is_buzzing:
                 status = "🔔 Buzzing"
             elif row.notified:
                 status = "✅ Notified"
             else:
                 status = "⏳ Watching"
-            
-            # Format last checked info
+
             last_status = row.last_checked_status if row.last_checked_status else "Pending..."
             last_time = row.last_checked_time if row.last_checked_time else ""
             last_check_info = f"\n   Last Check: {last_status} at {last_time}" if last_time else f"\n   Last Check: {last_status}"
@@ -400,8 +408,6 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     target = rows[index - 1]
-    
-    # Stop buzzer logic (updates DB and deletes)
     stop_buzzer(target.id)
 
     await update.message.reply_text(
@@ -434,6 +440,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("myalerts", my_alerts))
     app.add_handler(CommandHandler("deletealert", delete_alert))
+    app.add_handler(CommandHandler("checkstatus", check_status_command))
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(handle_stop_callback, pattern=r"^stop_\d+$"))
 

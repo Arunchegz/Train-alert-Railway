@@ -1,12 +1,13 @@
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, date
 
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Request, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import insert, select, update, delete
+from sqlalchemy import insert, select, update, delete, and_
 from telegram import Update
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
 
@@ -19,16 +20,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("train-alert")
 
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
+# Fix #4: secret key for /test-check endpoint
+TEST_CHECK_SECRET = os.environ.get("TEST_CHECK_SECRET", "")
 
-app = FastAPI()
-templates = Jinja2Templates(directory="templates")
-
-_bot_app = build_application()
-
-# ── Bad statuses that mean "no availability" ──────────────────────────────────
-# Note: 'ERROR' is included here because if the API explicitly returns "ERROR",
-# it usually means the train/date/class combo is invalid or fully booked logically.
-# However, None (network error) is handled separately.
 NO_AVAILABILITY_STATUSES = {
     "REGRET",
     "NOT AVAILABLE",
@@ -92,7 +86,6 @@ def purge_expired_alerts():
             logger.warning(f"Could not parse date for alert {row.id}: {row.journey_date}")
 
     if expired:
-        # Stop any buzzers for expired alerts by updating DB
         with engine.connect() as conn:
             conn.execute(
                 update(alerts)
@@ -114,14 +107,12 @@ def buzz_alert(alert_id: int, chat_id: str, train_number: str,
     Called every 5 seconds while a seat is available.
     Re-checks availability; stops automatically if seats disappear.
     """
-    # Check DB to see if this alert is still marked as buzzing
     try:
         with engine.connect() as conn:
             row = conn.execute(
                 select(alerts).where(alerts.c.id == alert_id)
             ).first()
-            
-            # If alert doesn't exist or is_buzzing is False, stop
+
             if not row or not row.is_buzzing:
                 try:
                     scheduler.remove_job(f"buzz_{alert_id}")
@@ -138,8 +129,6 @@ def buzz_alert(alert_id: int, chat_id: str, train_number: str,
         logger.error(f"Buzz re-check error for alert {alert_id}: {e}")
         return
 
-    # If status is None, it means a network error occurred.
-    # We do NOT stop the buzzer. We just log and skip this cycle.
     if status is None:
         logger.warning(f"Network error for alert {alert_id}, skipping notification.")
         return
@@ -147,10 +136,8 @@ def buzz_alert(alert_id: int, chat_id: str, train_number: str,
     status = str(status).strip().upper()
 
     if status in NO_AVAILABILITY_STATUSES:
-        # Seats gone — stop buzzing, do NOT mark notified so it can re-trigger later
         logger.info(f"Seats gone for alert {alert_id}, stopping buzzer (status={status})")
-        
-        # Update DB to stop buzzing
+
         try:
             with engine.connect() as conn:
                 conn.execute(
@@ -166,7 +153,7 @@ def buzz_alert(alert_id: int, chat_id: str, train_number: str,
             scheduler.remove_job(f"buzz_{alert_id}")
         except Exception:
             pass
-            
+
         send_alert(
             chat_id,
             f"😔 *Seats no longer available*\n\n"
@@ -176,7 +163,6 @@ def buzz_alert(alert_id: int, chat_id: str, train_number: str,
         )
         return
 
-    # Seats still available — buzz again!
     logger.info(f"Buzzing alert {alert_id} (status={status})")
     send_buzz_message(
         chat_id,
@@ -196,8 +182,6 @@ def check_alerts():
     logger.info(f"Checking alerts at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 50)
 
-    purge_expired_alerts()
-
     try:
         with engine.connect() as conn:
             rows = conn.execute(select(alerts)).fetchall()
@@ -210,12 +194,10 @@ def check_alerts():
     for row in rows:
         logger.info(f"Checking alert ID {row.id}")
 
-        # Skip if already notified
         if row.notified:
             logger.info("Already notified, skipping")
             continue
-        
-        # Skip if buzzer already running (check DB)
+
         if row.is_buzzing:
             logger.info("Buzzer already running, skipping")
             continue
@@ -230,38 +212,29 @@ def check_alerts():
             )
             logger.info(f"Train={row.train_number} Class={row.class_code} Status={status}")
 
-            # If status is None, it was a network error. Don't start buzzer.
             if status is None:
                 logger.warning(f"Network error checking alert {row.id}, skipping.")
-                # Still update last checked time/status to reflect the attempt
                 _update_last_check(row.id, "NETWORK_ERROR", datetime.now())
                 continue
 
             status = str(status).strip().upper()
-            
-            # Update last checked status and time for ALL checks
             _update_last_check(row.id, status, datetime.now())
 
-            # If status is 'ERROR' (logical error from API), don't start buzzer
             if status in NO_AVAILABILITY_STATUSES:
                 logger.info(f"Non-bookable status for alert {row.id}: {status}")
                 continue
 
-            # Evaluate alert_on condition
             alert_on = row.alert_on if row.alert_on else "AVAILABLE"
             should_trigger = False
 
             if alert_on == "AVAILABLE":
-                # Triggers only if status starts with 'AVAILABLE', 'AVBL', or 'CURR_AVBL'
                 if status.startswith("AVAILABLE") or status.startswith("AVBL") or status.startswith("CURR_AVBL"):
                     should_trigger = True
             elif alert_on == "RAC":
-                # Triggers if status starts with 'AVAILABLE', 'AVBL', 'CURR_AVBL', or 'RAC'
-                if (status.startswith("AVAILABLE") or status.startswith("AVBL") or 
-                    status.startswith("CURR_AVBL") or status.startswith("RAC")):
+                if (status.startswith("AVAILABLE") or status.startswith("AVBL") or
+                        status.startswith("CURR_AVBL") or status.startswith("RAC")):
                     should_trigger = True
             elif alert_on == "WL":
-                # Triggers if status is not in NO_AVAILABILITY_STATUSES
                 if status not in NO_AVAILABILITY_STATUSES:
                     should_trigger = True
 
@@ -271,20 +244,25 @@ def check_alerts():
 
             logger.info(f"Bookable status found for alert {row.id} — starting buzzer")
 
-            # Mark this alert as actively buzzing in DB
+            # Fix #6: atomic check-and-set to prevent double-spawn race condition
+            # Only update (and proceed) if is_buzzing is still False in DB
             try:
                 with engine.connect() as conn:
-                    conn.execute(
+                    result = conn.execute(
                         update(alerts)
-                        .where(alerts.c.id == row.id)
+                        .where(and_(alerts.c.id == row.id, alerts.c.is_buzzing == False))
                         .values(is_buzzing=True)
                     )
                     conn.commit()
+
+                if result.rowcount == 0:
+                    # Another cycle already claimed this alert
+                    logger.info(f"Alert {row.id} already claimed by another cycle, skipping")
+                    continue
             except Exception as e:
-                logger.error(f"Failed to update is_buzzing for alert {row.id}: {e}")
+                logger.error(f"Failed to atomically set is_buzzing for alert {row.id}: {e}")
                 continue
 
-                # Send the first buzz immediately
             send_buzz_message(
                 row.telegram_chat_id,
                 row.id,
@@ -296,7 +274,6 @@ def check_alerts():
                 f"_You'll be notified every 5 seconds until you book or tap_ 🛑 *Stop Alert*.",
             )
 
-            # Schedule a repeating 5-second buzz job
             scheduler.add_job(
                 buzz_alert,
                 "interval",
@@ -322,14 +299,15 @@ def check_alerts():
 def _update_last_check(alert_id: int, status: str, dt: datetime) -> None:
     """Helper to update last_checked_status and last_checked_time in DB."""
     try:
-        time_str = dt.strftime("%H:%M:%S (%d-%m-%Y)")
+        # Fix #8: store as ISO timestamp for consistency
+        time_str = dt.isoformat(timespec="seconds")
         with engine.connect() as conn:
             conn.execute(
                 update(alerts)
                 .where(alerts.c.id == alert_id)
                 .values(
                     last_checked_status=status,
-                    last_checked_time=time_str
+                    last_checked_time=time_str,
                 )
             )
             conn.commit()
@@ -337,9 +315,10 @@ def _update_last_check(alert_id: int, status: str, dt: datetime) -> None:
         logger.error(f"Failed to update last check info for alert {alert_id}: {e}")
 
 
-# ── FastAPI lifecycle ─────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def startup_event():
+# ── FastAPI lifespan (fix #9: replaces deprecated @app.on_event) ──────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     for attempt in range(15):
         try:
             init_db()
@@ -350,6 +329,9 @@ async def startup_event():
             time.sleep(5)
     else:
         logger.error("Database never became ready — proceeding anyway")
+
+    _bot_app = build_application()
+    app.state.bot_app = _bot_app
 
     await _bot_app.initialize()
     await _bot_app.start()
@@ -370,6 +352,7 @@ async def startup_event():
         id="train_alert_checker",
         replace_existing=True,
     )
+    # Fix #11: purge only via midnight cron, not inside check_alerts
     scheduler.add_job(
         purge_expired_alerts,
         "cron",
@@ -383,21 +366,25 @@ async def startup_event():
     scheduler.start()
     logger.info("Scheduler started")
 
+    yield
 
-@app.on_event("shutdown")
-async def shutdown_event():
+    # Shutdown
     await _bot_app.stop()
     await _bot_app.shutdown()
     scheduler.shutdown()
     logger.info("Shutdown complete")
 
 
+app = FastAPI(lifespan=lifespan)
+templates = Jinja2Templates(directory="templates")
+
+
 # ── Webhook endpoint ──────────────────────────────────────────────────────────
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
-    tg_update = Update.de_json(data, _bot_app.bot)
-    await _bot_app.process_update(tg_update)
+    tg_update = Update.de_json(data, request.app.state.bot_app.bot)
+    await request.app.state.bot_app.process_update(tg_update)
     return JSONResponse(content={"ok": True})
 
 
@@ -420,19 +407,24 @@ def add_alert_web(
     journey_date: str = Form(...),
     class_code: str = Form(...),
     telegram_chat_id: str = Form(...),
+    alert_on: str = Form("AVAILABLE"),  # Fix #5: expose alert_on in web form
 ):
+    valid_alert_on = {"AVAILABLE", "RAC", "WL"}
+    if alert_on not in valid_alert_on:
+        alert_on = "AVAILABLE"
+
     with engine.connect() as conn:
         conn.execute(
             insert(alerts).values(
                 train_number=train_number,
-                from_station=from_station,
-                to_station=to_station,
+                from_station=from_station.strip().upper(),
+                to_station=to_station.strip().upper(),
                 journey_date=journey_date,
-                class_code=class_code,
+                class_code=class_code.strip().upper(),
                 telegram_chat_id=telegram_chat_id,
                 notified=False,
                 is_buzzing=False,
-                alert_on="AVAILABLE", # Default for web form
+                alert_on=alert_on,
                 last_checked_status=None,
                 last_checked_time=None,
             )
@@ -442,6 +434,9 @@ def add_alert_web(
 
 
 @app.get("/test-check")
-def test_check():
+def test_check(x_secret: str = Header(default="")):
+    # Fix #4: guard with secret key
+    if TEST_CHECK_SECRET and x_secret != TEST_CHECK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
     check_alerts()
     return {"success": True, "message": "Manual check completed"}

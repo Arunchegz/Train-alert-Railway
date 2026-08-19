@@ -1,5 +1,4 @@
 import os
-import time
 from sqlalchemy import (
     create_engine,
     MetaData,
@@ -15,11 +14,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///alerts.db")
 
 # Railway gives postgres:// but SQLAlchemy needs postgresql://
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace(
-        "postgres://",
-        "postgresql://",
-        1,
-    )
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 engine = create_engine(
     DATABASE_URL,
@@ -42,11 +37,8 @@ alerts = Table(
     Column("class_code", String),
     Column("telegram_chat_id", String),
     Column("notified", Boolean, default=False),
-    # New column to track if the buzzer is currently active for this alert
     Column("is_buzzing", Boolean, default=False),
-    # New column: Alert condition type (AVAILABLE, RAC, WL)
     Column("alert_on", String, default="AVAILABLE"),
-    # New columns: Track last check result
     Column("last_checked_status", String, nullable=True),
     Column("last_checked_time", String, nullable=True),
 )
@@ -55,8 +47,7 @@ alerts = Table(
 def init_db():
     """Create tables if they don't exist and run auto-migrations."""
     metadata.create_all(engine)
-    
-    # Run migrations for SQLite or Postgres
+
     with engine.connect() as conn:
         try:
             if DATABASE_URL.startswith("sqlite"):
@@ -67,8 +58,7 @@ def init_db():
                     "SELECT column_name FROM information_schema.columns WHERE table_name='alerts'"
                 ))
                 columns = [row[0] for row in cursor.fetchall()]
-            
-            # Add missing columns
+
             if "is_buzzing" not in columns:
                 conn.execute(text("ALTER TABLE alerts ADD COLUMN is_buzzing BOOLEAN DEFAULT 0"))
                 print("Database migration: Added is_buzzing column")
@@ -81,18 +71,7 @@ def init_db():
             if "last_checked_time" not in columns:
                 conn.execute(text("ALTER TABLE alerts ADD COLUMN last_checked_time VARCHAR"))
                 print("Database migration: Added last_checked_time column")
-                
+
             conn.commit()
         except Exception as e:
             print(f"Migration check/execution error: {e}")
-
-
-# Retry DB startup
-for attempt in range(15):
-    try:
-        init_db()
-        print("Database connected")
-        break
-    except Exception as e:
-        print(f"Database not ready ({attempt + 1}/15): {e}")
-        time.sleep(5)

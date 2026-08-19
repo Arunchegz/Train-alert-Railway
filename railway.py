@@ -1,12 +1,12 @@
 import logging
+import os
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Global session to reuse connections and avoid leaks
+# Shared session with retry — used by both railway API and Telegram bot calls
 _session = requests.Session()
 
-# Configure retry strategy
 retry_strategy = Retry(
     total=3,
     backoff_factor=2,
@@ -14,6 +14,9 @@ retry_strategy = Retry(
 )
 adapter = HTTPAdapter(max_retries=retry_strategy)
 _session.mount("https://", adapter)
+_session.mount("http://", adapter)
+
+BOT_API_URL = "https://api.telegram.org/bot"
 
 logger = logging.getLogger("train-alert")
 
@@ -28,7 +31,7 @@ def get_status(
 ):
     """
     Fetches seat availability status from Railyatri API.
-    
+
     Returns:
         str: The availability status (e.g., 'AVAILABLE', 'RAC') if successful.
         None: If a network error, timeout, or server error occurs.
@@ -44,14 +47,11 @@ def get_status(
 
         response = _session.get(
             url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-            },
-            timeout=20
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            timeout=20,
         )
 
         response.raise_for_status()
-
         data = response.json()
 
         if not data.get("success"):
@@ -66,7 +66,7 @@ def get_status(
 
         seat = seats[0]
         status = seat.get("availablity_status", "ERROR")
-        
+
         return str(status).upper()
 
     except requests.exceptions.Timeout:
