@@ -197,7 +197,15 @@ async def my_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             status = "⏳ Watching"
 
-        last_status = row.last_checked_status if row.last_checked_status else "Pending..."
+        if row.last_checked_status == "IRCTC_MAINTENANCE":
+            last_status = "IRCTC Maintenance (23:45–05:00 IST)"
+        elif row.last_checked_status == "NETWORK_ERROR":
+            last_status = "Network Error (Retrying...)"
+        elif row.last_checked_status:
+            last_status = row.last_checked_status
+        else:
+            last_status = "Pending..."
+
         last_time = row.last_checked_time if row.last_checked_time else ""
         last_check_info = f"\n   Last Check: `{last_status}` at {last_time}" if last_time else f"\n   Last Check: `{last_status}`"
 
@@ -404,7 +412,15 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             else:
                 status = "⏳ Watching"
 
-            last_status = row.last_checked_status if row.last_checked_status else "Pending..."
+            if row.last_checked_status == "IRCTC_MAINTENANCE":
+                last_status = "IRCTC Maintenance (23:45–05:00 IST)"
+            elif row.last_checked_status == "NETWORK_ERROR":
+                last_status = "Network Error (Retrying...)"
+            elif row.last_checked_status:
+                last_status = row.last_checked_status
+            else:
+                last_status = "Pending..."
+
             last_time = row.last_checked_time if row.last_checked_time else ""
             last_check_info = f"\n   Last Check: `{last_status}` at {last_time}" if last_time else f"\n   Last Check: `{last_status}`"
 

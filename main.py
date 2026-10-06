@@ -12,7 +12,7 @@ from telegram import Update
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
 
 from models import engine, alerts, init_db
-from railway import get_status
+from railway import get_status, get_last_error
 from telegram_bot import send_alert, send_buzz_message, stop_buzzer, build_application, BOT_TOKEN, WEBHOOK_URL
 from scheduler import scheduler
 
@@ -213,8 +213,9 @@ def check_alerts():
             logger.info(f"Train={row.train_number} Class={row.class_code} Status={status}")
 
             if status is None:
-                logger.warning(f"Network error checking alert {row.id}, skipping.")
-                _update_last_check(row.id, "NETWORK_ERROR", datetime.now())
+                err = get_last_error() or "NETWORK_ERROR"
+                logger.warning(f"Check skipped for alert {row.id} ({err}), skipping.")
+                _update_last_check(row.id, err, datetime.now())
                 continue
 
             status = str(status).strip().upper()

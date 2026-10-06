@@ -26,6 +26,13 @@ _session.mount("http://", adapter)
 
 logger = logging.getLogger("train-alert")
 
+_last_error = None
+
+
+def get_last_error():
+    global _last_error
+    return _last_error
+
 
 def normalize_date(journey_date: str) -> str:
     """
@@ -63,6 +70,9 @@ def get_status(
         str: Availability status such as AVAILABLE-0048, CURR_AVBL-0088, RAC, GNWL..., NOT AVAILABLE.
         None: Temporary network error or upstream IRCTC error (so scheduler retries later).
     """
+    global _last_error
+    _last_error = None
+
     user_id = user_id or DEFAULT_USER_ID
     auth_token = auth_token or DEFAULT_AUTH_TOKEN
     clean_date = normalize_date(journey_date)
@@ -111,11 +121,13 @@ def get_status(
                 train_no,
                 response.text[:500],
             )
+            _last_error = "API_ERROR"
             return None
 
         if not data.get("success", False):
             msg = data.get("message") or data.get("error")
             logger.warning("RailYatri returned success=False | train=%s | message=%s", train_no, msg)
+            _last_error = "API_ERROR"
             return None
 
         # Check for upstream IRCTC error or messages
@@ -129,11 +141,13 @@ def get_status(
             logger.warning("RailYatri reported error for train %s: %s", train_no, error_msg)
             # If IRCTC is undergoing maintenance or temporarily unable to process
             if "UNABLE TO PROCESS" in error_upper or "TRY AGAIN" in error_upper:
+                _last_error = "IRCTC_MAINTENANCE"
                 return None
 
         seats = data.get("seat_availibility") or data.get("seat_availability") or []
         if not seats:
             logger.warning("No seat availability data found | train=%s | data=%s", train_no, data)
+            _last_error = _last_error or "NO_DATA"
             return None
 
         # Look for the seat record matching the target date
@@ -161,10 +175,12 @@ def get_status(
         if not status:
             return None
 
+        _last_error = None
         return str(status).strip().upper()
 
     except requests.exceptions.RequestException as e:
         logger.error("Network or API error while fetching train %s: %s", train_no, e)
+        _last_error = "NETWORK_ERROR"
         return None
 
 
