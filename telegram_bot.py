@@ -44,11 +44,17 @@ ALERT_ON_OPTIONS = [
 def send_alert(chat_id: str, message: str) -> None:
     """Send a plain text alert (no inline button), with retry via shared session."""
     try:
-        _session.post(
+        res = _session.post(
             f"{BOT_API_URL}{BOT_TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
             timeout=30,
         )
+        if res.status_code == 400:
+            _session.post(
+                f"{BOT_API_URL}{BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": message},
+                timeout=30,
+            )
     except Exception as exc:
         logger.error("Failed to send alert to %s: %s", chat_id, exc)
 
@@ -59,7 +65,7 @@ def send_buzz_message(chat_id: str, alert_id: int, message: str) -> None:
         [[InlineKeyboardButton("🛑 Stop Alert", callback_data=f"stop_{alert_id}")]]
     )
     try:
-        _session.post(
+        res = _session.post(
             f"{BOT_API_URL}{BOT_TOKEN}/sendMessage",
             json={
                 "chat_id": chat_id,
@@ -69,6 +75,16 @@ def send_buzz_message(chat_id: str, alert_id: int, message: str) -> None:
             },
             timeout=30,
         )
+        if res.status_code == 400:
+            _session.post(
+                f"{BOT_API_URL}{BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": message,
+                    "reply_markup": keyboard.to_dict(),
+                },
+                timeout=30,
+            )
     except Exception as exc:
         logger.error("Failed to send buzz to %s: %s", chat_id, exc)
 
@@ -183,14 +199,18 @@ async def my_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         last_status = row.last_checked_status if row.last_checked_status else "Pending..."
         last_time = row.last_checked_time if row.last_checked_time else ""
-        last_check_info = f"\n   Last Check: {last_status} at {last_time}" if last_time else f"\n   Last Check: {last_status}"
+        last_check_info = f"\n   Last Check: `{last_status}` at {last_time}" if last_time else f"\n   Last Check: `{last_status}`"
 
         lines.append(
             f"{i}. Train *{row.train_number}* | {row.from_station} → {row.to_station}\n"
             f"   Date: {row.journey_date} | Class: {row.class_code} | {status}"
             f"{last_check_info}"
         )
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    text = "\n".join(lines)
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text(text)
 
 
 # ── /addalert conversation ────────────────────────────────────────────────────
@@ -386,14 +406,18 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             last_status = row.last_checked_status if row.last_checked_status else "Pending..."
             last_time = row.last_checked_time if row.last_checked_time else ""
-            last_check_info = f"\n   Last Check: {last_status} at {last_time}" if last_time else f"\n   Last Check: {last_status}"
+            last_check_info = f"\n   Last Check: `{last_status}` at {last_time}" if last_time else f"\n   Last Check: `{last_status}`"
 
             lines.append(
                 f"{i}. Train *{row.train_number}* | {row.from_station} → {row.to_station}\n"
                 f"   Date: {row.journey_date} | Class: {row.class_code} | {status}"
                 f"{last_check_info}"
             )
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        text = "\n".join(lines)
+        try:
+            await update.message.reply_text(text, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(text)
         return
 
     try:
@@ -410,12 +434,15 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     target = rows[index - 1]
     stop_buzzer(target.id)
 
-    await update.message.reply_text(
+    msg = (
         f"🗑️ Deleted alert for train *{target.train_number}* "
         f"({target.from_station} → {target.to_station}, "
-        f"{target.journey_date}, {target.class_code}).",
-        parse_mode="Markdown",
+        f"{target.journey_date}, {target.class_code})."
     )
+    try:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text(msg.replace("*", ""))
 
 
 # ── App builder ───────────────────────────────────────────────────────────────
@@ -436,6 +463,9 @@ def build_application() -> Application:
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error("Exception while handling Telegram update: %s", context.error, exc_info=context.error)
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("myalerts", my_alerts))
@@ -443,5 +473,6 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("checkstatus", check_status_command))
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(handle_stop_callback, pattern=r"^stop_\d+$"))
+    app.add_error_handler(on_error)
 
     return app
