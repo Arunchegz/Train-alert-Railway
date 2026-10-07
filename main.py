@@ -349,7 +349,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         check_alerts,
         "interval",
-        minutes=4,
+        minutes=CHECK_INTERVAL_MINUTES,
         id="train_alert_checker",
         replace_existing=True,
     )
