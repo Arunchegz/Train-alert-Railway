@@ -20,6 +20,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("train-alert")
 
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
+CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "4"))
 # Fix #4: secret key for /test-check endpoint
 TEST_CHECK_SECRET = os.environ.get("TEST_CHECK_SECRET", "")
 
