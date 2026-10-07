@@ -8,8 +8,8 @@ from urllib3.util.retry import Retry
 BOT_API_URL = os.environ.get("BOT_API_URL", "https://api.telegram.org/bot")
 
 # RailYatri default credentials (can be overridden via environment variables)
-DEFAULT_USER_ID = os.environ.get("RAILYATRI_USER_ID", "409b738e3c56567ee21b4fdbc9dfd6b0")
-DEFAULT_AUTH_TOKEN = os.environ.get("RAILYATRI_AUTH_TOKEN", "f17fdd9dea99d4ca6f62b8ce0ca95e34")
+DEFAULT_USER_ID = os.environ.get("RAILYATRI_USER_ID")
+DEFAULT_AUTH_TOKEN = os.environ.get("RAILYATRI_AUTH_TOKEN")
 
 _session = requests.Session()
 
