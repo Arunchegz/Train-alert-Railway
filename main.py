@@ -136,8 +136,9 @@ def buzz_alert(alert_id: int, chat_id: str, train_number: str,
 
     status = str(status).strip().upper()
 
-    if status in NO_AVAILABILITY_STATUSES:
-        logger.info(f"Seats gone for alert {alert_id}, stopping buzzer (status={status})")
+    # A trailing # means availability is shown before booking opens (e.g. AVAILABLE-0042#).
+    if status.endswith("#") or status in NO_AVAILABILITY_STATUSES:
+        logger.info(f"Non-bookable status for alert {alert_id}, stopping buzzer (status={status})")
 
         try:
             with engine.connect() as conn:
@@ -222,7 +223,8 @@ def check_alerts():
             status = str(status).strip().upper()
             _update_last_check(row.id, status, datetime.now())
 
-            if status in NO_AVAILABILITY_STATUSES:
+            # Ignore availability counts ending in #; booking has not started yet.
+            if status.endswith("#") or status in NO_AVAILABILITY_STATUSES:
                 logger.info(f"Non-bookable status for alert {row.id}: {status}")
                 continue
 
